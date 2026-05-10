@@ -19,6 +19,17 @@ except Exception:
 _GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
 
 
+def _resource_path(relative_path: str) -> Path:
+    """Get absolute path to resource, works for dev and for PyInstaller."""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = Path(sys._MEIPASS)
+    except Exception:
+        base_path = Path(__file__).parent
+
+    return base_path / relative_path
+
+
 def _default_graph_path() -> str:
     out = Path(_GRAPHIFY_OUT)
     if (out / "graph.db").exists() and not (out / "graph.json").exists():
@@ -223,11 +234,7 @@ def install(platform: str = "claude") -> None:
         sys.exit(1)
 
     cfg = _PLATFORM_CONFIG[platform]
-    skill_src = Path(__file__).parent / cfg["skill_file"]
-
-    if getattr(sys, "frozen", False) and not skill_src.exists():
-        # Fallback for PyInstaller bundle structure
-        skill_src = Path(sys._MEIPASS) / "graphify" / cfg["skill_file"]
+    skill_src = _resource_path(cfg["skill_file"])
 
     if not skill_src.exists():
         print(f"error: {cfg['skill_file']} not found in package - reinstall graphify", file=sys.stderr)
@@ -365,7 +372,7 @@ def gemini_install(project_dir: Path | None = None) -> None:
     """Copy skill file to ~/.gemini/skills/graphify/, write GEMINI.md section, and install BeforeTool hook."""
     # Copy skill file to ~/.gemini/skills/graphify/SKILL.md
     # On Windows, Gemini CLI prioritises ~/.agents/skills/ over ~/.gemini/skills/
-    skill_src = Path(__file__).parent / "skill.md"
+    skill_src = _resource_path("skill.md")
     if platform.system() == "Windows":
         skill_dst = Path.home() / ".agents" / "skills" / "graphify" / "SKILL.md"
     else:
