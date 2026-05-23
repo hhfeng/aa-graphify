@@ -349,3 +349,77 @@ def test_gemini_uninstall_removes_hook(tmp_path):
 def test_gemini_uninstall_noop_if_not_installed(tmp_path):
     from graphify.__main__ import gemini_uninstall
     gemini_uninstall(tmp_path)  # should not raise
+
+
+# --- Hook injection probes must recognize both graph.json and graph.db ---
+
+def test_claude_hook_probes_both_backends():
+    """The Claude PreToolUse hook checks for KB existence before injecting
+    a reminder. It must trigger for graph.json AND graph.db KBs (regression
+    guard: previously only graph.json was probed)."""
+    from graphify.__main__ import _get_claude_hook
+    cmd = _get_claude_hook()["hooks"][0]["command"]
+    assert "graphify-out/graph.json" in cmd
+    assert "graphify-out/graph.db" in cmd
+
+
+def test_gemini_hook_probes_both_backends():
+    from graphify.__main__ import _get_gemini_hook
+    cmd = _get_gemini_hook()["hooks"][0]["command"]
+    assert "graph.json" in cmd
+    assert "graph.db" in cmd
+
+
+def test_opencode_plugin_probes_both_backends():
+    from graphify.__main__ import _OPENCODE_PLUGIN_JS
+    assert "graph.json" in _OPENCODE_PLUGIN_JS
+    assert "graph.db" in _OPENCODE_PLUGIN_JS
+
+
+# --- pyinstall tests ---
+
+def test_pyinstall_creates_pyaag_skill(tmp_path):
+    """pyinstall writes skill to ~/.claude/skills/pyaag/SKILL.md."""
+    from graphify.__main__ import pyinstall
+    with patch("graphify.__main__.Path.home", return_value=tmp_path):
+        pyinstall()
+    skill = tmp_path / ".claude" / "skills" / "pyaag" / "SKILL.md"
+    assert skill.exists()
+    content = skill.read_text()
+    # Frontmatter is correct
+    assert "name: pyaag" in content
+    assert "trigger: /pyaag" in content
+    # Uses python3 -c, not aag eval
+    assert "python3 -c" in content
+    assert "aag eval" not in content
+    # Uses graphify imports, not aag imports
+    assert "from graphify." in content
+    assert "from aag." not in content
+    # CLI subcommands use python3 -m graphify
+    assert "python3 -m graphify export" in content
+    # /pyaag in usage, not /aag
+    assert "/pyaag" in content
+    assert "/aag" not in content
+
+
+def test_pyinstall_registers_claude_md(tmp_path):
+    """pyinstall registers pyaag in CLAUDE.md."""
+    from graphify.__main__ import pyinstall
+    with patch("graphify.__main__.Path.home", return_value=tmp_path):
+        pyinstall()
+    claude_md = tmp_path / ".claude" / "CLAUDE.md"
+    assert claude_md.exists()
+    content = claude_md.read_text()
+    assert "pyaag" in content
+    assert "/pyaag" in content
+
+
+def test_pyinstall_idempotent(tmp_path):
+    """Running pyinstall twice does not duplicate CLAUDE.md registration."""
+    from graphify.__main__ import pyinstall
+    with patch("graphify.__main__.Path.home", return_value=tmp_path):
+        pyinstall()
+        pyinstall()
+    claude_md = tmp_path / ".claude" / "CLAUDE.md"
+    content = claude_md.read_text()
+    assert content.count("# pyaag") == 1  # only one registration block

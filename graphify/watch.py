@@ -124,7 +124,15 @@ def _rebuild_code(watch_path: Path, *, follow_symlinks: bool = False, force: boo
         cohesion = score_all(G, communities)
         gods = god_nodes(G)
         surprises = surprising_connections(G, communities)
-        labels_file = out / ".graphify_labels.json"
+        # Accept either the legacy ".graphify_labels.json" or the new
+        # ".aag_labels.json" written by the current aag skill — otherwise
+        # an `aag update` (or watch-triggered rebuild) right after a fresh
+        # /aag build silently resets every community label back to
+        # "Community N" because the skill writes the .aag_* name.
+        labels_file = next(
+            (out / n for n in (".graphify_labels.json", ".aag_labels.json") if (out / n).exists()),
+            out / ".graphify_labels.json",
+        )
         try:
             raw = json.loads(labels_file.read_text(encoding="utf-8")) if labels_file.exists() else {}
             labels = {int(k): v for k, v in raw.items() if int(k) in communities}
@@ -149,8 +157,9 @@ def _rebuild_code(watch_path: Path, *, follow_symlinks: bool = False, force: boo
         except Exception:
             pass
 
-        report = generate(G, communities, cohesion, labels, gods, surprises, detection,
-                          {"input": 0, "output": 0}, report_root, suggested_questions=questions,
+        report = generate(G, communities, labels, gods, surprises, detection,
+                          {"input": 0, "output": 0}, report_root,
+                          cohesion_scores=cohesion, suggested_questions=questions,
                           built_at_commit=commit)
         (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
 

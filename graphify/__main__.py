@@ -141,7 +141,7 @@ def _get_claude_hook() -> dict:
                     "print(d.get('tool_input',d).get('command',''))\" 2>/dev/null || true); "
                     "case \"$CMD\" in "
                     r"*grep*|*rg\ *|*ripgrep*|*find\ *|*fd\ *|*ack\ *|*ag\ *) "
-                    "  [ -f graphify-out/graph.json ] && "
+                    "  { [ -f graphify-out/graph.json ] || [ -f graphify-out/graph.db ]; } && "
                     r"""  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"aag: Knowledge graph exists. Read graphify-out/GRAPH_REPORT.md for god nodes and community structure before searching raw files."}}' """
                     "  || true ;; "
                     "esac"
@@ -162,7 +162,8 @@ def _get_gemini_hook() -> dict:
                 "command": (
                     f'{cmd} "'
                     "import sys,pathlib,json;"
-                    "e=pathlib.Path('graphify-out/graph.json').exists();"
+                    "p=pathlib.Path('graphify-out');"
+                    "e=(p/'graph.json').exists() or (p/'graph.db').exists();"
                     "d={'decision':'allow'};"
                     "e and d.update({'additionalContext':'aag: Knowledge graph exists. Read graphify-out/GRAPH_REPORT.md for god nodes and community structure before searching raw files.'});"
                     "sys.stdout.write(json.dumps(d))"
@@ -178,6 +179,14 @@ _SKILL_REGISTRATION = (
     "- any input to knowledge graph. Trigger: `/aag`\n"
     "When the user types `/aag`, invoke the Skill tool "
     "with `skill: \"aag\"` before doing anything else.\n"
+)
+
+_PYAAG_SKILL_REGISTRATION = (
+    "\n# pyaag\n"
+    "- **pyaag** (`~/.claude/skills/pyaag/SKILL.md`) "
+    "- any input to knowledge graph (python mode). Trigger: `/pyaag`\n"
+    "When the user types `/pyaag`, invoke the Skill tool "
+    "with `skill: \"pyaag\"` before doing anything else.\n"
 )
 
 
@@ -337,6 +346,116 @@ def install(platform: str = "claude") -> None:
     print("Done. Open your AI coding assistant and type:")
     print()
     print("  /aag .")
+    print()
+
+
+def pyinstall() -> None:
+    """Install the 'pyaag' skill that uses python3 directly (no binary needed)."""
+    skill_src = _resource_path("skill.md")
+    if not skill_src.exists():
+        print("error: skill.md not found in package - reinstall graphify", file=sys.stderr)
+        sys.exit(1)
+
+    content = skill_src.read_text(encoding="utf-8")
+
+    # 1. Frontmatter: rename skill
+    content = content.replace("name: aag", "name: pyaag", 1)
+    content = content.replace("trigger: /aag", "trigger: /pyaag", 1)
+
+    # 2. Module imports: aag -> graphify
+    content = content.replace("from aag.", "from graphify.")
+    content = content.replace("import aag", "import graphify")
+
+    # 3. Replace Step 1 interpreter detection block with simple python3
+    step1_pattern = r"### Step 1 - Ensure aag is installed\n\n```bash\n# Detect the correct Python interpreter.*?\n```"
+    step1_replacement = """### Step 1 - Ensure aag is installed
+
+```bash
+# Using python3 directly (pyinstall mode)
+PYTHON=python3
+mkdir -p graphify-out
+echo "$PYTHON" > graphify-out/.aag_python
+# Save scan root so `aag update` (no args) knows where to look next time
+echo "$(cd INPUT_PATH && pwd)" > graphify-out/.aag_root
+```"""
+    content = re.sub(step1_pattern, step1_replacement, content, flags=re.DOTALL)
+
+    # 4. Replace interpreter invocations with python3 -c
+    content = content.replace("$(cat graphify-out/.aag_python) -c \"", "python3 -c \"")
+    content = content.replace("\"$PYTHON\" -c \"", "python3 -c \"")
+
+    # 5. Replace interpreter guard section
+    guard_pattern = r"## Interpreter guard for subcommands\n\nBefore running any subcommand.*?```bash\nif \[ ! -f graphify-out/\.aag_python \]; then.*?fi\n```"
+    guard_replacement = """## Ensure python3 is available
+
+```bash
+# Using python3 directly (pyinstall mode)
+PYTHON=python3
+mkdir -p graphify-out
+echo "$PYTHON" > graphify-out/.aag_python
+```"""
+    content = re.sub(guard_pattern, guard_replacement, content, flags=re.DOTALL)
+
+    # 6. /aag references in usage -> /pyaag (must come before CLI subcommand replacement)
+    content = content.replace("/aag", "/pyaag")
+
+    # 7. CLI subcommands: aag <cmd> -> python3 -m graphify <cmd>
+    # Use regex to only match `aag` preceded by whitespace or start-of-line (not inside /pyaag)
+    content = content.replace("python3 -m aag.serve", "python3 -m graphify serve")
+    content = content.replace("python3 -m aag.watch", "python3 -m graphify watch")
+    cli_cmds = [
+        "export", "clone", "watch", "query", "path", "explain",
+        "hook", "claude", "serve", "benchmark", "cluster-only", "update",
+    ]
+    for cmd in cli_cmds:
+        content = re.sub(rf"(?<![/a-z])aag {cmd}", f"python3 -m graphify {cmd}", content)
+
+    # 8. Write to ~/.claude/skills/pyaag/SKILL.md
+    import os as _os
+    if _os.environ.get("CLAUDE_CONFIG_DIR"):
+        skill_dst = Path(_os.environ["CLAUDE_CONFIG_DIR"]) / "skills" / "pyaag" / "SKILL.md"
+    else:
+        skill_dst = Path.home() / ".claude" / "skills" / "pyaag" / "SKILL.md"
+    skill_dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if skill_dst.exists():
+        backup = skill_dst.with_suffix(skill_dst.suffix + ".bak")
+        try:
+            shutil.copy2(skill_dst, backup)
+        except Exception as e:
+            print(f"  warning: failed to back up existing skill: {e}")
+
+    tmp_dst = skill_dst.with_suffix(skill_dst.suffix + ".tmp")
+    try:
+        tmp_dst.write_text(content, encoding="utf-8")
+        os.replace(tmp_dst, skill_dst)
+    except Exception:
+        try:
+            tmp_dst.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    (skill_dst.parent / ".graphify_version").write_text(__version__, encoding="utf-8")
+    print(f"  skill installed  ->  {skill_dst}")
+
+    # 9. Register in ~/.claude/CLAUDE.md
+    claude_md = Path.home() / ".claude" / "CLAUDE.md"
+    if claude_md.exists():
+        md_content = claude_md.read_text(encoding="utf-8")
+        if "pyaag" in md_content:
+            print(f"  CLAUDE.md        ->  already registered (no change)")
+        else:
+            claude_md.write_text(md_content.rstrip() + _PYAAG_SKILL_REGISTRATION, encoding="utf-8")
+            print(f"  CLAUDE.md        ->  skill registered in {claude_md}")
+    else:
+        claude_md.parent.mkdir(parents=True, exist_ok=True)
+        claude_md.write_text(_PYAAG_SKILL_REGISTRATION.lstrip(), encoding="utf-8")
+        print(f"  CLAUDE.md        ->  created at {claude_md}")
+
+    print()
+    print("Done. Open Claude Code and type:")
+    print()
+    print("  /pyaag .")
     print()
 
 
@@ -803,7 +922,8 @@ def _cursor_uninstall(project_dir: Path) -> None:
 
 
 # OpenCode tool.execute.before plugin — fires before every tool call.
-# Injects a graph reminder into bash command output when graph.json exists.
+# Injects a graph reminder into bash command output when the KB exists
+# (either graph.json or graph.db, depending on the chosen backend).
 _OPENCODE_PLUGIN_JS = """\
 // graphify OpenCode plugin
 // Injects a knowledge graph reminder before bash tool calls when the graph exists.
@@ -816,7 +936,8 @@ export const GraphifyPlugin = async ({ directory }) => {
   return {
     "tool.execute.before": async (input, output) => {
       if (reminded) return;
-      if (!existsSync(join(directory, "graphify-out", "graph.json"))) return;
+      const out = join(directory, "graphify-out");
+      if (!existsSync(join(out, "graph.json")) && !existsSync(join(out, "graph.db"))) return;
 
       if (input.tool === "bash") {
         output.args.command =
@@ -1229,7 +1350,7 @@ def main() -> None:
     # Check all known skill install locations for a stale version stamp.
     # Skip during install/uninstall (hook writes trigger a fresh check anyway).
     # Deduplicate paths so platforms sharing the same install dir don't warn twice.
-    if not any(arg in ("install", "uninstall") for arg in sys.argv):
+    if not any(arg in ("install", "uninstall", "pyinstall", "hook-check") for arg in sys.argv):
         for skill_dst in {Path.home() / cfg["skill_dst"] for cfg in _PLATFORM_CONFIG.values()}:
             _check_skill_version(skill_dst)
 
@@ -1238,15 +1359,16 @@ def main() -> None:
         print()
         print("Commands:")
         print("  install [--platform P]  copy skill to platform config dir (claude|windows|codex|opencode|aider|claw|droid|trae|trae-cn|gemini|cursor|antigravity|hermes|kiro|pi)")
+        print("  pyinstall               install 'pyaag' skill using python3 (no binary needed, for development)")
         print("  uninstall               remove aag from all detected platforms in one shot")
         print("    --purge                 also delete graphify-out/ directory")
-        print("  path \"A\" \"B\"            shortest path between two nodes in graph.json")
+        print("  path \"A\" \"B\"            shortest path between two nodes in the knowledge graph")
         print("    --graph <path>          path to graph file (default graphify-out/graph.json or .db)")
         print("  explain \"X\"             plain-language explanation of a node and its neighbors")
         print("    --graph <path>          path to graph file (default graphify-out/graph.json or .db)")
         print("  clone <github-url>      clone a GitHub repo locally and print its path for /aag")
         print("  merge-driver <base> <current> <other>  git merge driver: union-merge two graph.json files (set up via hook install)")
-        print("  merge-graphs <g1> <g2>  merge two or more graph.json files into one cross-repo graph")
+        print("  merge-graphs <g1> <g2>  merge two or more per-repo graphs (graph.json or graph.db) into one cross-repo graph")
         print("    --out <path>            output path (default: graphify-out/merged-graph.json)")
         print("    --branch <branch>       checkout a specific branch (default: repo default)")
         print("    --out <dir>             clone to a custom directory (default: ~/.graphify/repos/<owner>/<repo>)")
@@ -1256,12 +1378,12 @@ def main() -> None:
         print("    --dir <path>            target directory (default: ./raw)")
         print("  watch <path>            watch a folder and rebuild the graph on code changes")
         print("  update <path>           re-extract code files and update the graph (no LLM needed)")
-        print("    --force                 overwrite graph.json even if the rebuild has fewer nodes")
+        print("    --force                 overwrite the persisted graph even if the rebuild has fewer nodes")
         print("                            (also: GRAPHIFY_FORCE=1 env var; use after refactors that delete code)")
-        print("  cluster-only <path>     rerun clustering on an existing graph.json and regenerate report")
+        print("  cluster-only <path>     rerun clustering on an existing graph (graph.json or graph.db) and regenerate report")
         print("    --no-viz                skip graph.html generation (useful for >5000 node graphs / CI)")
         print("    --graph <path>          path to graph file (default <path>/graphify-out/graph.json or .db)")
-        print("  query \"<question>\"       BFS traversal of graph.json for a question")
+        print("  query \"<question>\"       BFS traversal of the knowledge graph for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
         print("    --context C             explicit edge-context filter (repeatable)")
         print("    --budget N              cap output at N tokens (default 2000)")
@@ -1273,7 +1395,7 @@ def main() -> None:
         print("    --nodes N1 N2 ...       source node labels cited in the answer")
         print("    --memory-dir DIR        memory directory (default: graphify-out/memory)")
         print("  check-update <path>     check needs_update flag and notify if semantic re-extraction is pending (cron-safe)")
-        print("  tree                    emit a D3 v7 collapsible-tree HTML for graph.json")
+        print("  tree                    emit a D3 v7 collapsible-tree HTML for the knowledge graph")
         print("    --graph PATH            path to graph file (default graphify-out/graph.json or .db)")
         print("    --output HTML           output path (default graphify-out/GRAPH_TREE.html)")
         print("    --root PATH             filesystem root for the hierarchy")
@@ -1284,16 +1406,17 @@ def main() -> None:
         print("    --backend B             gemini|kimi|claude|openai|ollama (default: whichever API key is set)")
         print("    --model M               override backend default model")
         print("    --out DIR               output dir (default: <path>); writes <DIR>/graphify-out/")
+        print("    --domain D              activate domain plugins (comma-separated: finance,diligence)")
         print("    --google-workspace      export .gdoc/.gsheet/.gslides shortcuts via gws before extraction")
         print("    --no-cluster            skip clustering, write raw extraction only")
         print("    --global                also merge the resulting graph into the global graph")
         print("    --as <tag>              repo tag for --global (default: target directory name)")
-        print("  global add <graph.json>  add/update a project graph in the global graph (~/.graphify/global-graph.json)")
+        print("  global add <graph-path>  add/update a project graph (graph.json or graph.db) in the global graph (~/.graphify/global-graph.json)")
         print("    --as <tag>               repo tag (default: parent directory name)")
         print("  global remove <tag>      remove a repo's nodes from the global graph")
         print("  global list              list repos in the global graph")
         print("  global path              print path to the global graph file")
-        print("  benchmark [graph.json]  measure token reduction vs naive full-corpus approach")
+        print("  benchmark [graph-path]  measure token reduction vs naive full-corpus approach (graph-path defaults to graphify-out/, accepts graph.json or graph.db)")
         print("  hook install            install post-commit/post-checkout git hooks (all platforms)")
         print("  hook uninstall          remove git hooks")
         print("  hook status             check if git hooks are installed")
@@ -1395,6 +1518,8 @@ def main() -> None:
                 i += 1
         chosen_platform = selected_platform or default_platform
         install(platform=chosen_platform)
+    elif cmd == "pyinstall":
+        pyinstall()
     elif cmd == "uninstall":
         purge = "--purge" in sys.argv[2:]
         uninstall_all(purge=purge)
@@ -1770,7 +1895,14 @@ def main() -> None:
         gods = god_nodes(G)
         surprises = surprising_connections(G, communities)
         out = watch_path / "graphify-out"
-        labels_path = out / ".graphify_labels.json"
+        # Accept either the legacy ".graphify_labels.json" or the new
+        # ".aag_labels.json" name written by the current aag skill. Prefer
+        # whichever already exists so the write-back below stays on the
+        # same filename and doesn't fragment the labels into two files.
+        labels_path = next(
+            (out / n for n in (".graphify_labels.json", ".aag_labels.json") if (out / n).exists()),
+            out / ".graphify_labels.json",
+        )
         if labels_path.exists():
             try:
                 labels = {int(k): v for k, v in json.loads(labels_path.read_text(encoding="utf-8")).items()}
@@ -1782,9 +1914,20 @@ def main() -> None:
         tokens = {"input": 0, "output": 0}
         from graphify.export import _git_head as _gh
         _commit = _gh()
-        report = generate(G, communities, cohesion, labels, gods, surprises,
+        # Load pre-existing synthesized narratives if available
+        _narratives = []
+        _analysis_path = out / ".aag_analysis.json"
+        if _analysis_path.exists():
+            try:
+                _prev = json.loads(_analysis_path.read_text(encoding="utf-8"))
+                _narratives = _prev.get("synthesized_narratives", [])
+            except Exception:
+                pass
+        report = generate(G, communities, labels, gods, surprises,
                           {"warning": "cluster-only mode — file stats not available"},
-                          tokens, str(watch_path), suggested_questions=questions,
+                          tokens, str(watch_path), cohesion_scores=cohesion,
+                          suggested_questions=questions,
+                          synthesized_narratives=_narratives or None,
                           min_community_size=min_community_size, built_at_commit=_commit)
         (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
         _store.save(out, G, communities)
@@ -1819,9 +1962,17 @@ def main() -> None:
         if len(argv) > 2:
             watch_path = Path(argv[2])
         else:
-            # Try to recover the scan root saved by the last full build
-            saved = Path(_GRAPHIFY_OUT) / ".graphify_root"
-            if saved.exists():
+            # Try to recover the scan root saved by the last full build.
+            # The aag skill writes `.aag_root`; watch._rebuild_code writes
+            # `.graphify_root` on rebuild. Accept either so `aag update`
+            # (no args) right after a fresh /aag build doesn't silently
+            # fall back to cwd and re-index the wrong directory.
+            _go = Path(_GRAPHIFY_OUT)
+            saved = next(
+                (_go / n for n in (".graphify_root", ".aag_root") if (_go / n).exists()),
+                None,
+            )
+            if saved is not None:
                 watch_path = Path(saved.read_text(encoding="utf-8").strip())
             else:
                 watch_path = Path(".")
@@ -2055,7 +2206,7 @@ def main() -> None:
 
     elif cmd == "export":
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
-        if subcmd not in ("html", "obsidian", "wiki", "svg", "graphml", "neo4j"):
+        if subcmd not in ("html", "obsidian", "wiki", "svg", "graphml", "neo4j", "dashboard"):
             print("Usage: graphify export <format>", file=sys.stderr)
             print("  html      [--graph PATH] [--labels PATH] [--node-limit N] [--no-viz]", file=sys.stderr)
             print("  obsidian  [--graph PATH] [--labels PATH] [--dir PATH]", file=sys.stderr)
@@ -2064,6 +2215,7 @@ def main() -> None:
             print("  graphml   [--graph PATH]", file=sys.stderr)
             print("  neo4j     [--graph PATH] [--push URI] [--user U] [--password P]", file=sys.stderr)
             print("            (or set NEO4J_PASSWORD instead of --password to keep it off argv)", file=sys.stderr)
+            print("  dashboard [--open]  generate dashboard.html from analysis JSON", file=sys.stderr)
             sys.exit(1)
 
         # Parse shared args
@@ -2203,6 +2355,17 @@ def main() -> None:
                 _to_cypher(G, str(out_dir / "cypher.txt"))
                 print(f"cypher.txt written - import with: cypher-shell < {out_dir}/cypher.txt")
 
+        elif subcmd == "dashboard":
+            from graphify.dashboard import render_dashboard_from_file as _render_dash_file
+            if not analysis_path.exists():
+                print("error: .graphify_analysis.json not found. Run `graphify extract` first.", file=sys.stderr)
+                sys.exit(1)
+            _dash_out = _render_dash_file(analysis_path, graph_path)
+            print(f"dashboard.html written to {_dash_out}")
+            if "--open" in args:
+                import webbrowser
+                webbrowser.open(f"file://{_dash_out.resolve()}")
+
     elif cmd == "benchmark":
         from graphify.benchmark import run_benchmark, print_benchmark
         # Default to whichever backend exists in graphify-out/.
@@ -2305,6 +2468,7 @@ def main() -> None:
         global_merge = False
         global_repo_tag: str | None = None
         use_db = False
+        domain_names: list[str] = []
         args = sys.argv[3:]
         i = 0
         while i < len(args):
@@ -2333,8 +2497,17 @@ def main() -> None:
                 global_repo_tag = args[i + 1]; i += 2
             elif a == "--db":
                 use_db = True; i += 1
+            elif a == "--domain" and i + 1 < len(args):
+                domain_names.extend(args[i + 1].split(",")); i += 2
+            elif a.startswith("--domain="):
+                domain_names.extend(a.split("=", 1)[1].split(",")); i += 1
             else:
                 i += 1
+
+        # Load domain plugins if requested
+        domain_config: dict | None = None
+        if domain_names:
+            domain_config = {"domains": domain_names}
 
         # Backend resolution. If user did not pass --backend, sniff env.
         # If backend was explicitly requested, validate its key is present
@@ -2469,12 +2642,20 @@ def main() -> None:
 
             if uncached_paths:
                 print(f"[graphify extract] semantic extraction on {len(uncached_paths)} files via {backend}...")
+                # Hook 1: inject domain prompt fragments into semantic extraction
+                extra_prompt = ""
+                if domain_config:
+                    from graphify.domain import active_domains as _active_domains
+                    for _dom in _active_domains(domain_config):
+                        if _dom.prompt_fragments:
+                            extra_prompt += "\n\n" + _dom.prompt_fragments()
                 try:
                     fresh = _extract_corpus_parallel(
                         [Path(p) for p in uncached_paths],
                         backend=backend,
                         model=model,
                         root=target,
+                        extra_prompt=extra_prompt or None,
                     )
                 except ImportError as exc:
                     print(f"error: {exc}", file=sys.stderr)
@@ -2511,6 +2692,37 @@ def main() -> None:
             "input_tokens": ast_result.get("input_tokens", 0) + sem_result.get("input_tokens", 0),
             "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
         }
+
+        # --- Domain plugin hooks 2 & 3 ---
+        if domain_config:
+            from graphify.domain import active_domains as _active_domains_merge
+            _domains = _active_domains_merge(domain_config)
+            # Hook 2: domain structural extractors (tables, spreadsheets, etc.)
+            all_paths = code_files + semantic_files
+            for _dom in _domains:
+                for _ext in _dom.extractors:
+                    for _p in all_paths:
+                        if any(_p.match(pat) for pat in _ext.file_patterns):
+                            try:
+                                _content = _p.read_text(encoding="utf-8", errors="replace")
+                                _extra = _ext.extract(_p, _content)
+                                for _n in _extra.get("nodes", []):
+                                    _n["id"] = f"{_dom.name}__{_n['id']}"
+                                    _n["domain"] = _dom.name
+                                for _e in _extra.get("edges", []):
+                                    _e["source"] = f"{_dom.name}__{_e['source']}"
+                                    _e["target"] = f"{_dom.name}__{_e['target']}"
+                                merged["nodes"].extend(_extra.get("nodes", []))
+                                merged["edges"].extend(_extra.get("edges", []))
+                            except Exception as _exc:
+                                print(f"[graphify extract] domain {_dom.name} extractor skipped {_p}: {_exc}", file=sys.stderr)
+            # Hook 3: post_extract inference (conflict detection, edge fixing, etc.)
+            for _dom in _domains:
+                if _dom.post_extract:
+                    try:
+                        merged = _dom.post_extract(merged)
+                    except Exception as _exc:
+                        print(f"[graphify extract] domain {_dom.name} post_extract failed: {_exc}", file=sys.stderr)
 
         graph_json_path = graphify_out / "graph.json"
         analysis_path = graphify_out / ".graphify_analysis.json"
@@ -2602,6 +2814,17 @@ def main() -> None:
 
         communities = _cluster(G)
         cohesion = _score_all(G, communities)
+
+        # Hook 4: post_build — domain graph-level inference (adds edges to G)
+        if domain_config:
+            from graphify.domain import active_domains as _active_domains_pb
+            for _dom in _active_domains_pb(domain_config):
+                if _dom.post_build:
+                    try:
+                        _dom.post_build(G)
+                    except Exception as _exc:
+                        print(f"[graphify extract] domain {_dom.name} post_build failed: {_exc}", file=sys.stderr)
+
         try:
             gods = _god_nodes(G)
         except Exception:
@@ -2610,6 +2833,17 @@ def main() -> None:
             surprises = _surprising(G, communities)
         except Exception:
             surprises = []
+
+        # Hook 5: domain-specific analyzers (read-only reporting)
+        domain_analysis: dict = {}
+        if domain_config:
+            from graphify.domain import active_domains as _active_domains_an
+            for _dom in _active_domains_an(domain_config):
+                for _analyzer in _dom.analyzers:
+                    try:
+                        domain_analysis[f"{_dom.name}.{_analyzer.__name__}"] = _analyzer(G)
+                    except Exception as _exc:
+                        print(f"[graphify extract] domain analyzer {_dom.name}.{_analyzer.__name__} failed: {_exc}", file=sys.stderr)
 
         from graphify import store as _store_save
         _store_save.save(graphify_out, G, communities, backend=("db" if use_db else None), force=True)
@@ -2635,7 +2869,29 @@ def main() -> None:
                 "output": merged["output_tokens"],
             },
         }
+        if domain_analysis:
+            analysis["domain_analysis"] = domain_analysis
+            # Synthesize risk narratives (requires LLM — skip gracefully if unavailable)
+            try:
+                from graphify.synthesize import synthesize_risks as _synth
+                _rf = domain_analysis.get("diligence.red_flag_analyzer", [])
+                _kp = domain_analysis.get("diligence.key_person_risk_analyzer", [])
+                if _rf or _kp:
+                    analysis["synthesized_narratives"] = _synth(G, _rf, _kp)
+                    print(f"[graphify extract] synthesized {len(analysis['synthesized_narratives'])} risk narratives")
+            except Exception as _synth_exc:
+                print(f"[graphify extract] note: synthesis skipped ({_synth_exc})", file=sys.stderr)
         analysis_path.write_text(json.dumps(analysis, indent=2), encoding="utf-8")
+
+        # Generate dashboard.html when domain analysis is present
+        if domain_analysis:
+            try:
+                from graphify.dashboard import render_dashboard as _render_dash
+                _dash_meta = {"nodes": len(G), "edges": G.size()}
+                _dash_path = _render_dash(analysis, _dash_meta, graphify_out / "dashboard.html", G=G)
+                print(f"[graphify extract] dashboard.html written to {_dash_path}")
+            except Exception as _dash_exc:
+                print(f"[graphify extract] warning: could not generate dashboard: {_dash_exc}", file=sys.stderr)
         try:
             _save_manifest(files_by_type, manifest_path=str(manifest_path))
         except Exception as exc:
